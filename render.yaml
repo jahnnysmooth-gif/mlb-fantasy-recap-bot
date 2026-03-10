@@ -5,7 +5,7 @@ services:
     plan: starter
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python daily_fantasy_summary.py"
-    schedule: "0 2 * * *"
+    schedule: "0 6 * * *"
     envVars:
       - key: https://discord.com/api/webhooks/1480987022889058339/5zp8Pjvzr29tFeptMBy3oFx-x-sijhrMP7s8yDcL1LAFIlQquMyKL4NRmMfaAoXHFFiQ
         sync: false
