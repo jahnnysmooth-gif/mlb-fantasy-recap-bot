@@ -68,6 +68,57 @@ def safe_float(value):
         return 0.0
 
 
+def collect_statcast_notes(feed):
+    plays = feed.get("liveData", {}).get("plays", {}).get("allPlays", [])
+
+    longest_hr = None
+    hardest_hit = None
+
+    for play in plays:
+        matchup = play.get("matchup", {})
+        batter = matchup.get("batter", {})
+        batter_name = batter.get("fullName", "Unknown Player")
+
+        result = play.get("result", {})
+        event = (result.get("event") or "").lower()
+        description = result.get("description", "")
+
+        play_events = play.get("playEvents", []) or []
+        last_event = play_events[-1] if play_events else {}
+        hit_data = play.get("hitData", {}) or last_event.get("hitData", {}) or {}
+
+        launch_speed = safe_float(hit_data.get("launchSpeed"))
+        total_distance = safe_float(hit_data.get("totalDistance"))
+        launch_angle = safe_float(hit_data.get("launchAngle"))
+
+        if launch_speed > 0:
+            candidate = {
+                "name": batter_name,
+                "ev": launch_speed,
+                "distance": total_distance,
+                "angle": launch_angle,
+                "description": description,
+            }
+            if hardest_hit is None or candidate["ev"] > hardest_hit["ev"]:
+                hardest_hit = candidate
+
+        if "home_run" in event or event == "home run":
+            candidate = {
+                "name": batter_name,
+                "ev": launch_speed,
+                "distance": total_distance,
+                "angle": launch_angle,
+                "description": description,
+            }
+            if longest_hr is None or candidate["distance"] > longest_hr["distance"]:
+                longest_hr = candidate
+
+    return {
+        "longest_hr": longest_hr,
+        "hardest_hit": hardest_hit,
+    }
+
+
 def collect_game_notes(feed):
     boxscore = feed.get("liveData", {}).get("boxscore", {})
     teams = boxscore.get("teams", {})
@@ -195,55 +246,6 @@ def collect_game_notes(feed):
         "pitchers": pitchers,
         "longest_hr": statcast_notes["longest_hr"],
         "hardest_hit": statcast_notes["hardest_hit"],
-    }
-
-
-def collect_statcast_notes(feed):
-    plays = feed.get("liveData", {}).get("plays", {}).get("allPlays", [])
-
-    longest_hr = None
-    hardest_hit = None
-
-    for play in plays:
-        matchup = play.get("matchup", {})
-        batter = matchup.get("batter", {})
-        batter_name = batter.get("fullName", "Unknown Player")
-
-        result = play.get("result", {})
-        event = (result.get("event") or "").lower()
-        description = result.get("description", "")
-
-        hit_data = play.get("hitData", {}) or play.get("playEvents", [{}])[-1].get("hitData", {}) or {}
-
-        launch_speed = safe_float(hit_data.get("launchSpeed"))
-        total_distance = safe_float(hit_data.get("totalDistance"))
-        launch_angle = safe_float(hit_data.get("launchAngle"))
-
-        if launch_speed > 0:
-            candidate = {
-                "name": batter_name,
-                "ev": launch_speed,
-                "distance": total_distance,
-                "angle": launch_angle,
-                "description": description,
-            }
-            if hardest_hit is None or candidate["ev"] > hardest_hit["ev"]:
-                hardest_hit = candidate
-
-        if "home_run" in event or event == "home run":
-            candidate = {
-                "name": batter_name,
-                "ev": launch_speed,
-                "distance": total_distance,
-                "angle": launch_angle,
-                "description": description,
-            }
-            if longest_hr is None or candidate["distance"] > longest_hr["distance"]:
-                longest_hr = candidate
-
-    return {
-        "longest_hr": longest_hr,
-        "hardest_hit": hardest_hit,
     }
 
 
@@ -514,36 +516,39 @@ def build_message_text(summary_data):
     pretty_date = date_obj.strftime("%A, %B %d, %Y").replace(" 0", " ")
 
     lines = [
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"📋 **FANTASY RECAP — {pretty_date}**",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "══════════════════════════════════════════════════════════════════════════════════",
+        "📊 **FANTASY BASEBALL DAILY RECAP**",
+        f"🗓️ {pretty_date}",
+        "══════════════════════════════════════════════════════════════════════════════════",
         "",
-        "🔥 **Top Hitters**",
+        "🔥 **TOP HITTERS**",
         fmt_top_hitters(summary_data["top_hitters"]),
         "",
-        "💣 **Multi-HR Games**",
+        "💣 **MULTI-HR GAMES**",
         fmt_multi_hr(summary_data["multi_hr"]),
         "",
-        "💨 **Multi-SB Games**",
+        "💨 **MULTI-SB GAMES**",
         fmt_multi_sb(summary_data["multi_sb"]),
         "",
-        "⚾ **Longest HR of the Day**",
+        "⚾ **LONGEST HR OF THE DAY**",
         fmt_longest_hr(summary_data["longest_hr"]),
         "",
-        "💨 **Hardest Hit Ball**",
+        "💨 **HARDEST HIT BALL**",
         fmt_hardest_hit(summary_data["hardest_hit"]),
         "",
-        "🔥 **Best Pitching Lines**",
+        "🔥 **BEST PITCHING LINES**",
         fmt_best_pitchers(summary_data["best_pitchers"]),
         "",
-        "🔒 **Saves**",
+        "🔒 **SAVES**",
         fmt_simple_list(summary_data["saves"], "No saves recorded."),
         "",
-        "🚨 **Blown Saves**",
+        "🚨 **BLOWN SAVES**",
         fmt_simple_list(summary_data["blown_saves"], "No blown saves recorded."),
         "",
-        "🚑 **Injury / Transaction Notes**",
+        "🚑 **INJURY / TRANSACTION NOTES**",
         fmt_injuries(summary_data["injuries"]),
+        "",
+        "═════════════════════════════════════════════════════════════════════════════════",
     ]
 
     return "\n".join(lines)
