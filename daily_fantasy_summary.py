@@ -1,5 +1,3 @@
-cd ~/Documents/mlb-fantasy-recap-bot
-cat > daily_fantasy_summary.py <<'PY'
 import os
 import time
 import requests
