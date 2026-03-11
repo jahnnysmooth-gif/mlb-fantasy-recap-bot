@@ -315,11 +315,26 @@ def post_to_discord(text, max_retries=8):
 
             if r.status_code == 429:
                 retry_after = 2.0
+                body = {}
+
                 try:
-                    data = r.json()
-                    retry_after = float(data.get("retry_after", 2))
+                    body = r.json()
+                    retry_after = float(body.get("retry_after", 2))
                 except Exception:
                     pass
+
+                print("429 body:", body if body else r.text)
+                print(
+                    "429 headers:",
+                    {
+                        "Retry-After": r.headers.get("Retry-After"),
+                        "X-RateLimit-Scope": r.headers.get("X-RateLimit-Scope"),
+                        "X-RateLimit-Global": r.headers.get("X-RateLimit-Global"),
+                        "X-RateLimit-Bucket": r.headers.get("X-RateLimit-Bucket"),
+                        "X-RateLimit-Remaining": r.headers.get("X-RateLimit-Remaining"),
+                        "X-RateLimit-Reset-After": r.headers.get("X-RateLimit-Reset-After"),
+                    },
+                )
 
                 wait_time = retry_after + 1.0
                 print(
