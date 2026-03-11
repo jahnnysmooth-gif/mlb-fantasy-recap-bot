@@ -1,5 +1,6 @@
 import os
 import time
+import random
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -253,9 +254,9 @@ def build_message_text(summary_data):
     pretty_date = date_obj.strftime("%A, %B %d, %Y").replace(" 0", " ")
 
     lines = [
-        "━━━━━━━━━━━━━━━━━━",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"📋 **FANTASY RECAP — {pretty_date}**",
-        "━━━━━━━━━━━━━━━━━━",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         "",
         "🔥 **Top Hitters**",
         fmt_top_hitters(summary_data["top_hitters"]),
@@ -295,7 +296,22 @@ def split_message(text, limit=1900):
     return chunks
 
 
-def post_to_discord(text, max_retries=8):
+def get_retry_after_seconds(response):
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return float(retry_after)
+        except Exception:
+            pass
+
+    try:
+        data = response.json()
+        return float(data.get("retry_after", 60))
+    except Exception:
+        return 60.0
+
+
+def post_to_discord(text, max_retries=6):
     chunks = split_message(text)
 
     for chunk_index, chunk in enumerate(chunks, start=1):
@@ -314,50 +330,38 @@ def post_to_discord(text, max_retries=8):
                 break
 
             if r.status_code == 429:
-                retry_after = 2.0
-                body = {}
+                retry_after = get_retry_after_seconds(r)
+                buffer_seconds = 10 + (attempt * 15)
+                jitter = random.randint(0, 10)
+                wait_time = retry_after + buffer_seconds + jitter
 
-                try:
-                    body = r.json()
-                    retry_after = float(body.get("retry_after", 2))
-                except Exception:
-                    pass
-
-                print("429 body:", body if body else r.text)
+                print("429 raw Retry-After header:", r.headers.get("Retry-After"))
+                print("429 body preview:", r.text[:300])
                 print(
-                    "429 headers:",
-                    {
-                        "Retry-After": r.headers.get("Retry-After"),
-                        "X-RateLimit-Scope": r.headers.get("X-RateLimit-Scope"),
-                        "X-RateLimit-Global": r.headers.get("X-RateLimit-Global"),
-                        "X-RateLimit-Bucket": r.headers.get("X-RateLimit-Bucket"),
-                        "X-RateLimit-Remaining": r.headers.get("X-RateLimit-Remaining"),
-                        "X-RateLimit-Reset-After": r.headers.get("X-RateLimit-Reset-After"),
-                    },
-                )
-
-                wait_time = retry_after + 1.0
-                print(
-                    f"Rate limited by Discord. Waiting {wait_time} seconds... "
+                    f"Rate limited by Discord/Cloudflare. Waiting {wait_time:.1f} seconds "
                     f"(attempt {attempt + 1}/{max_retries})"
                 )
+
                 time.sleep(wait_time)
                 continue
 
-            print(f"Discord post failed: {r.status_code} - {r.text}")
+            print(f"Discord post failed: {r.status_code} - {r.text[:500]}")
             return False
 
         if not posted:
-            print("Discord webhook stayed rate limited after all retries. Skipping remaining chunks.")
+            print("Webhook stayed unavailable after all retries. Skipping remaining chunks.")
             return False
 
         if chunk_index < len(chunks):
-            time.sleep(1.25)
+            time.sleep(5)
 
     return True
 
 
 def main():
+    # small random delay so repeated overnight jobs don't all hit at once
+    time.sleep(random.randint(5, 30))
+
     target_date = get_target_date()
     summary_data = build_summary_data(target_date)
 
