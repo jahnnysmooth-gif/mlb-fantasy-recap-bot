@@ -2,7 +2,7 @@ import os
 import time
 import random
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
@@ -10,7 +10,12 @@ NY_TZ = ZoneInfo("America/New_York")
 
 SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
 LIVE_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
-TRANSACTIONS_URL = "https://statsapi.mlb.com/api/v1/transactions"
+
+HITTING_COLOR = 15105570
+PITCHING_COLOR = 3447003
+
+FIELD_LIMIT = 1024
+TOTAL_EMBED_TEXT_LIMIT = 6000
 
 
 def get_target_date():
@@ -39,21 +44,6 @@ def get_live_feed(game_pk):
     return r.json()
 
 
-def get_transactions_for_date(date_str):
-    try:
-        r = requests.get(
-            TRANSACTIONS_URL,
-            params={"sportId": 1, "date": date_str},
-            timeout=30,
-        )
-        r.raise_for_status()
-        data = r.json()
-        return data.get("transactions", [])
-    except Exception as e:
-        print(f"Transactions fetch failed for {date_str}: {e}")
-        return []
-
-
 def safe_int(value):
     try:
         return int(value or 0)
@@ -68,54 +58,94 @@ def safe_float(value):
         return 0.0
 
 
+def innings_to_outs(ip):
+    try:
+        ip_str = str(ip or "0")
+        if "." in ip_str:
+            whole, frac = ip_str.split(".", 1)
+            return int(whole) * 3 + int(frac)
+        return int(ip_str) * 3
+    except Exception:
+        return 0
+
+
 def collect_statcast_notes(feed):
     plays = feed.get("liveData", {}).get("plays", {}).get("allPlays", [])
 
-    longest_hr = None
-    hardest_hit = None
+    hardest_hits = []
+    fastest_pitches = []
 
     for play in plays:
-        matchup = play.get("matchup", {})
-        batter = matchup.get("batter", {})
-        batter_name = batter.get("fullName", "Unknown Player")
+        matchup = play.get("matchup", {}) or {}
+        batter = matchup.get("batter", {}) or {}
+        pitcher = matchup.get("pitcher", {}) or {}
 
-        result = play.get("result", {})
-        event = (result.get("event") or "").lower()
-        description = result.get("description", "")
+        batter_name = batter.get("fullName", "Unknown Player")
+        pitcher_name = pitcher.get("fullName", "Unknown Player")
 
         play_events = play.get("playEvents", []) or []
         last_event = play_events[-1] if play_events else {}
-        hit_data = play.get("hitData", {}) or last_event.get("hitData", {}) or {}
+        play_hit_data = play.get("hitData", {}) or last_event.get("hitData", {}) or {}
 
-        launch_speed = safe_float(hit_data.get("launchSpeed"))
-        total_distance = safe_float(hit_data.get("totalDistance"))
-        launch_angle = safe_float(hit_data.get("launchAngle"))
+        launch_speed = safe_float(play_hit_data.get("launchSpeed"))
+        total_distance = safe_float(play_hit_data.get("totalDistance"))
+        launch_angle = safe_float(play_hit_data.get("launchAngle"))
 
         if launch_speed > 0:
-            candidate = {
-                "name": batter_name,
-                "ev": launch_speed,
-                "distance": total_distance,
-                "angle": launch_angle,
-                "description": description,
-            }
-            if hardest_hit is None or candidate["ev"] > hardest_hit["ev"]:
-                hardest_hit = candidate
+            hardest_hits.append(
+                {
+                    "name": batter_name,
+                    "ev": launch_speed,
+                    "distance": total_distance,
+                    "angle": launch_angle,
+                }
+            )
 
-        if "home_run" in event or event == "home run":
-            candidate = {
-                "name": batter_name,
-                "ev": launch_speed,
-                "distance": total_distance,
-                "angle": launch_angle,
-                "description": description,
-            }
-            if longest_hr is None or candidate["distance"] > longest_hr["distance"]:
-                longest_hr = candidate
+        for event in play_events:
+            details = event.get("details", {}) or {}
+            pitch_data = event.get("pitchData", {}) or {}
+            start_speed = safe_float(pitch_data.get("startSpeed"))
+            pitch_type = details.get("type", {}) or {}
+            pitch_name = pitch_type.get("description") or details.get("description") or "Pitch"
+
+            if start_speed > 0:
+                fastest_pitches.append(
+                    {
+                        "name": pitcher_name,
+                        "velo": start_speed,
+                        "pitch_type": pitch_name,
+                    }
+                )
+
+    hardest_hits.sort(
+        key=lambda x: (x["ev"], x["distance"], x["angle"]),
+        reverse=True,
+    )
+
+    fastest_pitches.sort(
+        key=lambda x: x["velo"],
+        reverse=True,
+    )
+
+    unique_hardest_hits = []
+    seen_hard_hits = set()
+    for item in hardest_hits:
+        key = (item["name"], round(item["ev"], 1), round(item["distance"], 0), round(item["angle"], 0))
+        if key not in seen_hard_hits:
+            seen_hard_hits.add(key)
+            unique_hardest_hits.append(item)
+
+    unique_fastest_pitches = []
+    seen_fast_pitches = set()
+    for item in fastest_pitches:
+        key = (item["name"], round(item["velo"], 1), item["pitch_type"])
+        if key not in seen_fast_pitches:
+            seen_fast_pitches.add(key)
+            unique_fastest_pitches.append(item)
 
     return {
-        "longest_hr": longest_hr,
-        "hardest_hit": hardest_hit,
+        "hardest_hits": unique_hardest_hits[:3],
+        "fastest_pitches": unique_fastest_pitches[:3],
     }
 
 
@@ -123,17 +153,32 @@ def collect_game_notes(feed):
     boxscore = feed.get("liveData", {}).get("boxscore", {})
     teams = boxscore.get("teams", {})
 
-    away_team_name = teams.get("away", {}).get("team", {}).get("name", "Away Team")
-    home_team_name = teams.get("home", {}).get("team", {}).get("name", "Home Team")
+    game_data = feed.get("gameData", {}) or {}
+    gd_teams = game_data.get("teams", {}) or {}
+
+    away_team_name = (
+    gd_teams.get("away", {}).get("abbreviation")
+    or teams.get("away", {}).get("team", {}).get("abbreviation")
+    or teams.get("away", {}).get("team", {}).get("name")
+    or "AWAY"
+    )
+    home_team_name = (
+    gd_teams.get("home", {}).get("abbreviation")
+    or teams.get("home", {}).get("team", {}).get("abbreviation")
+    or teams.get("home", {}).get("team", {}).get("name")
+    or "HOME"
+    )
 
     away_players = teams.get("away", {}).get("players", {})
-    home_players = teams.get("home", {}).get("players", {})
 
+    home_players = teams.get("home", {}).get("players", {})
     hitters = []
     multi_hr = []
     multi_sb = []
     saves = []
     blown_saves = []
+    dominant_relief = []
+    holds = []
     pitchers = []
 
     all_players = []
@@ -197,12 +242,6 @@ def collect_game_notes(feed):
                 }
             )
 
-        if safe_int(pitching.get("saves")) >= 1:
-            saves.append({"name": name, "team": team})
-
-        if safe_int(pitching.get("blownSaves")) >= 1:
-            blown_saves.append({"name": name, "team": team})
-
         innings_pitched = pitching.get("inningsPitched")
         strikeouts = safe_int(pitching.get("strikeOuts"))
         earned_runs = safe_int(pitching.get("earnedRuns"))
@@ -210,6 +249,49 @@ def collect_game_notes(feed):
         losses = safe_int(pitching.get("losses"))
         hits_allowed = safe_int(pitching.get("hits"))
         walks = safe_int(pitching.get("baseOnBalls"))
+        games_started = safe_int(pitching.get("gamesStarted"))
+        saves_stat = safe_int(pitching.get("saves"))
+        holds_stat = safe_int(pitching.get("holds"))
+        outs_recorded = innings_to_outs(innings_pitched)
+
+        if saves_stat >= 1 and strikeouts >= 2:
+            saves.append(
+                {
+                    "name": name,
+                    "team": team,
+                    "k": strikeouts,
+                    "ip": innings_pitched,
+                }
+            )
+
+        if holds_stat >= 1 and strikeouts >= 2 and walks == 0:
+            holds.append(
+                {
+                    "name": name,
+                    "team": team,
+                    "ip": innings_pitched,
+                    "k": strikeouts,
+                    "h": hits_allowed,
+                    "bb": walks,
+                }
+            )
+
+        if (
+            games_started == 0
+            and outs_recorded >= 3
+            and strikeouts >= 3
+            and earned_runs == 0
+        ):
+            dominant_relief.append(
+                {
+                    "name": name,
+                    "team": team,
+                    "ip": innings_pitched,
+                    "k": strikeouts,
+                    "h": hits_allowed,
+                    "bb": walks,
+                }
+            )
 
         if innings_pitched:
             pitcher_score = (
@@ -235,7 +317,58 @@ def collect_game_notes(feed):
                 }
             )
 
+    plays = feed.get("liveData", {}).get("plays", {}).get("allPlays", [])
+    blown_save_pitchers = set()
+
+    for play in plays:
+        about = play.get("about", {}) or {}
+        inning = safe_int(about.get("inning"))
+        result = play.get("result", {}) or {}
+        event = (result.get("event") or "").lower()
+
+        if inning < 8:
+            continue
+
+        if "blown save" not in event:
+            continue
+
+        matchup = play.get("matchup", {}) or {}
+        pitcher = matchup.get("pitcher", {}) or {}
+        pitcher_name = pitcher.get("fullName")
+
+        if pitcher_name:
+            blown_save_pitchers.add(pitcher_name)
+
+    for player, team in all_players:
+        person = player.get("person", {})
+        name = person.get("fullName", "Unknown Player")
+        pitching = player.get("stats", {}).get("pitching", {})
+        player_blown_saves = safe_int(pitching.get("blownSaves"))
+
+        if name in blown_save_pitchers and player_blown_saves >= 1:
+            blown_saves.append(
+                {
+                    "name": name,
+                    "team": team,
+                    "ip": pitching.get("inningsPitched", "0.0"),
+                    "er": safe_int(pitching.get("earnedRuns")),
+                    "h": safe_int(pitching.get("hits")),
+                    "bb": safe_int(pitching.get("baseOnBalls")),
+                    "k": safe_int(pitching.get("strikeOuts")),
+                }
+            )
+
     statcast_notes = collect_statcast_notes(feed)
+
+    dominant_relief.sort(
+        key=lambda x: (x["k"], innings_to_outs(x["ip"]), -x["bb"], -x["h"]),
+        reverse=True,
+    )
+
+    holds.sort(
+        key=lambda x: (x["k"], innings_to_outs(x["ip"]), -x["h"]),
+        reverse=True,
+    )
 
     return {
         "hitters": hitters,
@@ -243,82 +376,27 @@ def collect_game_notes(feed):
         "multi_sb": multi_sb,
         "saves": saves,
         "blown_saves": blown_saves,
+        "dominant_relief": dominant_relief[:5],
+        "holds": holds[:5],
         "pitchers": pitchers,
-        "longest_hr": statcast_notes["longest_hr"],
-        "hardest_hit": statcast_notes["hardest_hit"],
+        "hardest_hits": statcast_notes["hardest_hits"],
+        "fastest_pitches": statcast_notes["fastest_pitches"],
     }
-
-
-def summarize_transactions(transactions):
-    injury_keywords = [
-        "injured list",
-        "7-day injured list",
-        "10-day injured list",
-        "15-day injured list",
-        "60-day injured list",
-        "placed on il",
-        "placed on the il",
-        "placed on injured list",
-        "reinstated",
-        "returned from",
-        "returned to roster",
-        "rehab assignment",
-        "medical emergency",
-        "bereavement",
-        "paternity",
-        "restricted list",
-        "suspended list",
-    ]
-
-    injury_items = []
-
-    for tx in transactions:
-        person = tx.get("person", {})
-        player_name = person.get("fullName", "Unknown Player")
-
-        to_team = tx.get("toTeam", {}) or {}
-        from_team = tx.get("fromTeam", {}) or {}
-        team_name = to_team.get("name") or from_team.get("name") or "Unknown Team"
-
-        type_desc = tx.get("typeDesc", "") or ""
-        description = tx.get("description", "") or ""
-        resolution = tx.get("resolutionDate", "") or ""
-        text_blob = f"{type_desc} {description}".lower()
-
-        if any(keyword in text_blob for keyword in injury_keywords):
-            injury_items.append(
-                {
-                    "name": player_name,
-                    "team": team_name,
-                    "type": type_desc.strip() or "Transaction",
-                    "desc": description.strip(),
-                    "date": resolution,
-                }
-            )
-
-    seen = set()
-    unique_items = []
-    for item in injury_items:
-        key = (item["name"], item["team"], item["type"], item["desc"])
-        if key not in seen:
-            seen.add(key)
-            unique_items.append(item)
-
-    return unique_items[:8]
 
 
 def build_summary_data(date_str):
     games = get_schedule_for_date(date_str)
-    transactions = get_transactions_for_date(date_str)
 
     all_hitters = []
     all_multi_hr = []
     all_multi_sb = []
     all_saves = []
     all_blown_saves = []
+    all_dominant_relief = []
+    all_holds = []
     all_pitchers = []
-    longest_hr_candidates = []
-    hardest_hit_candidates = []
+    all_hardest_hits = []
+    all_fastest_pitches = []
 
     for game in games:
         game_pk = game.get("gamePk")
@@ -336,13 +414,11 @@ def build_summary_data(date_str):
             all_multi_sb.extend(notes["multi_sb"])
             all_saves.extend(notes["saves"])
             all_blown_saves.extend(notes["blown_saves"])
+            all_dominant_relief.extend(notes["dominant_relief"])
+            all_holds.extend(notes["holds"])
             all_pitchers.extend(notes["pitchers"])
-
-            if notes["longest_hr"] is not None:
-                longest_hr_candidates.append(notes["longest_hr"])
-
-            if notes["hardest_hit"] is not None:
-                hardest_hit_candidates.append(notes["hardest_hit"])
+            all_hardest_hits.extend(notes["hardest_hits"])
+            all_fastest_pitches.extend(notes["fastest_pitches"])
 
         except Exception as e:
             print(f"Error processing game {game_pk}: {e}")
@@ -367,15 +443,41 @@ def build_summary_data(date_str):
         reverse=True,
     )
 
-    longest_hr = None
-    if longest_hr_candidates:
-        longest_hr = max(longest_hr_candidates, key=lambda x: x["distance"])
+    all_dominant_relief.sort(
+        key=lambda x: (x["k"], innings_to_outs(x["ip"]), -x["bb"], -x["h"]),
+        reverse=True,
+    )
 
-    hardest_hit = None
-    if hardest_hit_candidates:
-        hardest_hit = max(hardest_hit_candidates, key=lambda x: x["ev"])
+    all_holds.sort(
+        key=lambda x: (x["k"], innings_to_outs(x["ip"]), -x["h"]),
+        reverse=True,
+    )
 
-    injuries = summarize_transactions(transactions)
+    all_hardest_hits.sort(
+        key=lambda x: (x["ev"], x["distance"], x["angle"]),
+        reverse=True,
+    )
+
+    all_fastest_pitches.sort(
+        key=lambda x: x["velo"],
+        reverse=True,
+    )
+
+    unique_hardest_hits = []
+    seen_hard_hits = set()
+    for item in all_hardest_hits:
+        key = (item["name"], round(item["ev"], 1), round(item["distance"], 0), round(item["angle"], 0))
+        if key not in seen_hard_hits:
+            seen_hard_hits.add(key)
+            unique_hardest_hits.append(item)
+
+    unique_fastest_pitches = []
+    seen_fast_pitches = set()
+    for item in all_fastest_pitches:
+        key = (item["name"], round(item["velo"], 1), item["pitch_type"])
+        if key not in seen_fast_pitches:
+            seen_fast_pitches.add(key)
+            unique_fastest_pitches.append(item)
 
     return {
         "date": date_str,
@@ -384,11 +486,51 @@ def build_summary_data(date_str):
         "multi_sb": all_multi_sb,
         "saves": all_saves,
         "blown_saves": all_blown_saves,
+        "dominant_relief": all_dominant_relief[:5],
+        "holds": all_holds[:5],
         "best_pitchers": all_pitchers[:3],
-        "longest_hr": longest_hr,
-        "hardest_hit": hardest_hit,
-        "injuries": injuries,
+        "hardest_hits": unique_hardest_hits[:3],
+        "fastest_pitches": unique_fastest_pitches[:3],
     }
+
+
+def trim_field_text(text, limit=FIELD_LIMIT):
+    if not text:
+        return "—"
+
+    if len(text) <= limit:
+        return text
+
+    cutoff = text[: limit - 12]
+    last_newline = cutoff.rfind("\n")
+
+    if last_newline > 0:
+        cutoff = cutoff[:last_newline]
+
+    cutoff = cutoff.rstrip()
+    return cutoff + "\n• ...and more"
+
+
+def fmt_player_of_the_day(items):
+    if not items:
+        return "No standout hitter performance found."
+
+    p = items[0]
+
+    parts = []
+    if p["hr"] > 0:
+        parts.append(f'{p["hr"]} HR')
+    if p["rbi"] > 0:
+        parts.append(f'{p["rbi"]} RBI')
+    if p["runs"] > 0:
+        parts.append(f'{p["runs"]} R')
+    if p["sb"] > 0:
+        parts.append(f'{p["sb"]} SB')
+    if p["hits"] > 0:
+        parts.append(f'{p["hits"]} H')
+
+    line = f'• **{p["name"]}** ({p["team"]}): {", ".join(parts)}'
+    return trim_field_text(line)
 
 
 def fmt_top_hitters(items):
@@ -411,7 +553,7 @@ def fmt_top_hitters(items):
 
         lines.append(f'• **{p["name"]}** ({p["team"]}): {", ".join(parts)}')
 
-    return "\n".join(lines)
+    return trim_field_text("\n".join(lines))
 
 
 def fmt_multi_hr(items):
@@ -430,7 +572,7 @@ def fmt_multi_hr(items):
 
         lines.append(f'• **{p["name"]}** ({p["team"]}): {", ".join(parts)}')
 
-    return "\n".join(lines)
+    return trim_field_text("\n".join(lines))
 
 
 def fmt_multi_sb(items):
@@ -447,14 +589,37 @@ def fmt_multi_sb(items):
 
         lines.append(f'• **{p["name"]}** ({p["team"]}): {", ".join(parts)}')
 
-    return "\n".join(lines)
+    return trim_field_text("\n".join(lines))
 
 
-def fmt_simple_list(items, empty_text):
+def fmt_hardest_hits(items):
     if not items:
-        return empty_text
+        return "No hard-hit ball data found."
 
-    return "\n".join([f'• **{p["name"]}** ({p["team"]})' for p in items])
+    lines = []
+    for item in items:
+        parts = [f'• **{item["name"]}**']
+        if item["ev"] > 0:
+            parts.append(f'{item["ev"]:.1f} EV')
+        if item["distance"] > 0:
+            parts.append(f'{item["distance"]:.0f} ft')
+        if item["angle"] > 0:
+            parts.append(f'{item["angle"]:.0f}° LA')
+        lines.append(" — ".join(parts))
+
+    return trim_field_text("\n".join(lines))
+
+
+def fmt_pitcher_of_the_day(items):
+    if not items:
+        return "No standout pitching performance found."
+
+    p = items[0]
+    line = (
+        f'• **{p["name"]}** ({p["team"]}): '
+        f'{p["ip"]} IP, {p["k"]} K, {p["er"]} ER, {p["h"]} H, {p["bb"]} BB'
+    )
+    return trim_field_text(line)
 
 
 def fmt_best_pitchers(items):
@@ -467,110 +632,181 @@ def fmt_best_pitchers(items):
             f'• **{p["name"]}** ({p["team"]}): '
             f'{p["ip"]} IP, {p["k"]} K, {p["er"]} ER, {p["h"]} H, {p["bb"]} BB'
         )
-    return "\n".join(lines)
+    return trim_field_text("\n".join(lines))
 
 
-def fmt_longest_hr(item):
-    if not item:
-        return "No home run distance data found."
-
-    parts = [f'• **{item["name"]}**']
-    if item["distance"] > 0:
-        parts.append(f'{item["distance"]:.0f} ft')
-    if item["ev"] > 0:
-        parts.append(f'{item["ev"]:.1f} mph EV')
-    if item["angle"] > 0:
-        parts.append(f'{item["angle"]:.0f}° LA')
-
-    return " — ".join(parts)
-
-
-def fmt_hardest_hit(item):
-    if not item:
-        return "No hard-hit ball data found."
-
-    parts = [f'• **{item["name"]}**']
-    if item["ev"] > 0:
-        parts.append(f'{item["ev"]:.1f} mph EV')
-    if item["distance"] > 0:
-        parts.append(f'{item["distance"]:.0f} ft')
-    if item["angle"] > 0:
-        parts.append(f'{item["angle"]:.0f}° LA')
-
-    return " — ".join(parts)
-
-
-def fmt_injuries(items):
+def fmt_saves(items):
     if not items:
-        return "No notable injury-related transactions found."
+        return "No impact saves."
+
+    lines = []
+    for p in items:
+        lines.append(f'• **{p["name"]}** ({p["team"]}): {p["ip"]} IP, {p["k"]} K')
+
+    return trim_field_text("\n".join(lines))
+
+
+def fmt_holds(items):
+    if not items:
+        return "No holds with 2+ strikeouts and 0 walks."
+
+    lines = []
+    for p in items:
+        lines.append(
+            f'• **{p["name"]}** ({p["team"]}): '
+            f'{p["ip"]} IP, {p["k"]} K, {p["h"]} H, {p["bb"]} BB'
+        )
+
+    return trim_field_text("\n".join(lines))
+
+
+def fmt_dominant_relief(items):
+    if not items:
+        return "No dominant relief outings."
+
+    lines = []
+    for p in items:
+        lines.append(
+            f'• **{p["name"]}** ({p["team"]}): '
+            f'{p["ip"]} IP, {p["k"]} K, {p["h"]} H, {p["bb"]} BB'
+        )
+
+    return trim_field_text("\n".join(lines))
+
+
+def fmt_fastest_pitches(items):
+    if not items:
+        return "No pitch velocity data found."
 
     lines = []
     for item in items:
-        detail = item["desc"] if item["desc"] else item["type"]
-        lines.append(f'• **{item["name"]}** ({item["team"]}): {detail}')
-    return "\n".join(lines)
+        lines.append(
+            f'• **{item["name"]}**: {item["velo"]:.1f} mph ({item["pitch_type"]})'
+        )
+
+    return trim_field_text("\n".join(lines))
 
 
-def build_message_text(summary_data):
+def fmt_blown_saves(items):
+    if not items:
+        return "No blown saves in the 8th inning or later."
+
+    lines = []
+    for p in items:
+        lines.append(
+            f'• **{p["name"]}** ({p["team"]}): '
+            f'{p["ip"]} IP, {p["er"]} ER, {p["h"]} H, {p["bb"]} BB, {p["k"]} K'
+        )
+
+    return trim_field_text("\n".join(lines))
+
+
+def estimate_embed_size(embed):
+    total = 0
+    total += len(embed.get("title", ""))
+    total += len(embed.get("description", ""))
+    total += len(embed.get("footer", {}).get("text", ""))
+
+    for field in embed.get("fields", []):
+        total += len(field.get("name", ""))
+        total += len(field.get("value", ""))
+
+    return total
+
+
+def build_embeds(summary_data):
     date_obj = datetime.strptime(summary_data["date"], "%Y-%m-%d")
     pretty_date = date_obj.strftime("%A, %B %d, %Y").replace(" 0", " ")
+    timestamp = datetime.now(timezone.utc).isoformat()
 
-    lines = [
-        "══════════════════════════════════════════════════════════════════════════════════",
-        "📊 **FANTASY BASEBALL DAILY RECAP**",
-        f"🗓️ {pretty_date}",
-        "══════════════════════════════════════════════════════════════════════════════════",
-        "",
-        "🔥 **TOP HITTERS**",
-        fmt_top_hitters(summary_data["top_hitters"]),
-        "",
-        "💣 **MULTI-HR GAMES**",
-        fmt_multi_hr(summary_data["multi_hr"]),
-        "",
-        "💨 **MULTI-SB GAMES**",
-        fmt_multi_sb(summary_data["multi_sb"]),
-        "",
-        "⚾ **LONGEST HR OF THE DAY**",
-        fmt_longest_hr(summary_data["longest_hr"]),
-        "",
-        "💨 **HARDEST HIT BALL**",
-        fmt_hardest_hit(summary_data["hardest_hit"]),
-        "",
-        "🔥 **BEST PITCHING LINES**",
-        fmt_best_pitchers(summary_data["best_pitchers"]),
-        "",
-        "🔒 **SAVES**",
-        fmt_simple_list(summary_data["saves"], "No saves recorded."),
-        "",
-        "🚨 **BLOWN SAVES**",
-        fmt_simple_list(summary_data["blown_saves"], "No blown saves recorded."),
-        "",
-        "🚑 **INJURY / TRANSACTION NOTES**",
-        fmt_injuries(summary_data["injuries"]),
-        "",
-        "═════════════════════════════════════════════════════════════════════════════════",
-    ]
+    hitting_embed = {
+        "title": "⚾ Fantasy Baseball Daily Recap — Hitting",
+        "description": pretty_date,
+        "color": HITTING_COLOR,
+        "fields": [
+            {
+                "name": "🏆 Fantasy Player of the Day",
+                "value": fmt_player_of_the_day(summary_data["top_hitters"]),
+                "inline": False,
+            },
+            {
+                "name": "🔥 Top Hitters",
+                "value": fmt_top_hitters(summary_data["top_hitters"]),
+                "inline": False,
+            },
+            {
+                "name": "💣 Multi-HR Games",
+                "value": fmt_multi_hr(summary_data["multi_hr"]),
+                "inline": False,
+            },
+            {
+                "name": "💨 Multi-SB Games",
+                "value": fmt_multi_sb(summary_data["multi_sb"]),
+                "inline": False,
+            },
+            {
+                "name": "🚀 Hardest-Hit Balls",
+                "value": fmt_hardest_hits(summary_data["hardest_hits"]),
+                "inline": False,
+            },
+        ],
+        "footer": {"text": "MLB Stats API • Daily Fantasy Recap Bot"},
+        "timestamp": timestamp,
+    }
 
-    return "\n".join(lines)
+    pitching_embed = {
+        "title": "🎯 Fantasy Baseball Daily Recap — Pitching",
+        "description": pretty_date,
+        "color": PITCHING_COLOR,
+        "fields": [
+            {
+                "name": "🎯 Pitcher of the Day",
+                "value": fmt_pitcher_of_the_day(summary_data["best_pitchers"]),
+                "inline": False,
+            },
+            {
+                "name": "🔥 Best Pitching Performances",
+                "value": fmt_best_pitchers(summary_data["best_pitchers"]),
+                "inline": False,
+            },
+            {
+                "name": "🔒 Impact Saves",
+                "value": fmt_saves(summary_data["saves"]),
+                "inline": False,
+            },
+            {
+                "name": "🛠️ Holds Watch",
+                "value": fmt_holds(summary_data["holds"]),
+                "inline": False,
+            },
+            {
+                "name": "💪 Dominant Relief Outings",
+                "value": fmt_dominant_relief(summary_data["dominant_relief"]),
+                "inline": False,
+            },
+            {
+                "name": "⚡ Fastest Pitches Thrown",
+                "value": fmt_fastest_pitches(summary_data["fastest_pitches"]),
+                "inline": False,
+            },
+            {
+                "name": "🚨 Blown Saves",
+                "value": fmt_blown_saves(summary_data["blown_saves"]),
+                "inline": False,
+            },
+        ],
+        "footer": {"text": "MLB Stats API • Daily Fantasy Recap Bot"},
+        "timestamp": timestamp,
+    }
 
+    embeds = [hitting_embed, pitching_embed]
 
-def split_message(text, limit=1900):
-    chunks = []
-    current = ""
+    for embed in embeds:
+        size = estimate_embed_size(embed)
+        if size > TOTAL_EMBED_TEXT_LIMIT:
+            print(f"Warning: embed '{embed.get('title')}' estimated size is {size}, over limit.")
 
-    for line in text.splitlines():
-        addition = line if not current else "\n" + line
-        if len(current) + len(addition) > limit:
-            if current:
-                chunks.append(current)
-            current = line
-        else:
-            current += addition
-
-    if current:
-        chunks.append(current)
-
-    return chunks
+    return embeds
 
 
 def get_retry_after_seconds(response):
@@ -588,51 +824,41 @@ def get_retry_after_seconds(response):
         return 60.0
 
 
-def post_to_discord(text, max_retries=6):
-    chunks = split_message(text)
+def post_to_discord(embeds, max_retries=6):
+    payload = {"embeds": embeds}
 
-    for chunk_index, chunk in enumerate(chunks, start=1):
-        posted = False
+    for attempt in range(max_retries):
+        r = requests.post(
+            DISCORD_WEBHOOK_URL,
+            json=payload,
+            timeout=30,
+        )
 
-        for attempt in range(max_retries):
-            r = requests.post(
-                DISCORD_WEBHOOK_URL,
-                json={"content": chunk},
-                timeout=30,
+        if r.status_code in (200, 204):
+            print(f"Posted {len(embeds)} embeds successfully.")
+            return True
+
+        if r.status_code == 429:
+            retry_after = get_retry_after_seconds(r)
+            buffer_seconds = 10 + (attempt * 15)
+            jitter = random.randint(0, 10)
+            wait_time = retry_after + buffer_seconds + jitter
+
+            print("429 raw Retry-After header:", r.headers.get("Retry-After"))
+            print("429 body preview:", r.text[:300])
+            print(
+                f"Rate limited by Discord/Cloudflare. Waiting {wait_time:.1f} seconds "
+                f"(attempt {attempt + 1}/{max_retries})"
             )
 
-            if r.status_code in (200, 204):
-                print(f"Posted chunk {chunk_index}/{len(chunks)} successfully.")
-                posted = True
-                break
+            time.sleep(wait_time)
+            continue
 
-            if r.status_code == 429:
-                retry_after = get_retry_after_seconds(r)
-                buffer_seconds = 10 + (attempt * 15)
-                jitter = random.randint(0, 10)
-                wait_time = retry_after + buffer_seconds + jitter
+        print(f"Discord post failed: {r.status_code} - {r.text[:1000]}")
+        return False
 
-                print("429 raw Retry-After header:", r.headers.get("Retry-After"))
-                print("429 body preview:", r.text[:300])
-                print(
-                    f"Rate limited by Discord/Cloudflare. Waiting {wait_time:.1f} seconds "
-                    f"(attempt {attempt + 1}/{max_retries})"
-                )
-
-                time.sleep(wait_time)
-                continue
-
-            print(f"Discord post failed: {r.status_code} - {r.text[:500]}")
-            return False
-
-        if not posted:
-            print("Webhook stayed unavailable after all retries. Skipping remaining chunks.")
-            return False
-
-        if chunk_index < len(chunks):
-            time.sleep(5)
-
-    return True
+    print("Webhook stayed unavailable after all retries.")
+    return False
 
 
 def main():
@@ -646,10 +872,14 @@ def main():
     print(f"Multi-HR games found: {len(summary_data['multi_hr'])}")
     print(f"Multi-SB games found: {len(summary_data['multi_sb'])}")
     print(f"Pitching lines found: {len(summary_data['best_pitchers'])}")
-    print(f"Injury notes found: {len(summary_data['injuries'])}")
+    print(f"Impact saves found: {len(summary_data['saves'])}")
+    print(f"Holds watch entries found: {len(summary_data['holds'])}")
+    print(f"Dominant relief outings found: {len(summary_data['dominant_relief'])}")
+    print(f"Fastest pitches found: {len(summary_data['fastest_pitches'])}")
+    print(f"Blown saves found: {len(summary_data['blown_saves'])}")
 
-    message_text = build_message_text(summary_data)
-    post_to_discord(message_text)
+    embeds = build_embeds(summary_data)
+    post_to_discord(embeds)
 
 
 if __name__ == "__main__":
