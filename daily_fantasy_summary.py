@@ -770,16 +770,6 @@ def build_embeds(summary_data):
                 "inline": False,
             },
             {
-                "name": "🔒 Impact Saves",
-                "value": fmt_saves(summary_data["saves"]),
-                "inline": False,
-            },
-            {
-                "name": "🛠️ Holds Watch",
-                "value": fmt_holds(summary_data["holds"]),
-                "inline": False,
-            },
-            {
                 "name": "💪 Dominant Relief Outings",
                 "value": fmt_dominant_relief(summary_data["dominant_relief"]),
                 "inline": False,
@@ -787,11 +777,6 @@ def build_embeds(summary_data):
             {
                 "name": "⚡ Fastest Pitches Thrown",
                 "value": fmt_fastest_pitches(summary_data["fastest_pitches"]),
-                "inline": False,
-            },
-            {
-                "name": "🚨 Blown Saves",
-                "value": fmt_blown_saves(summary_data["blown_saves"]),
                 "inline": False,
             },
         ],
